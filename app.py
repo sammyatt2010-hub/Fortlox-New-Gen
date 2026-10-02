@@ -3432,7 +3432,8 @@ class SentLog:
     """
 
     def __init__(self, path_secret: str = "GITHUB_LOG_PATH", default_path: str = "sent_log.json",
-                 local_name: str = ".sent_log.json") -> None:
+                 local_name: str = ".sent_log.json", compact: bool = False) -> None:
+        self.compact = compact  # Smaller file for big stores (saved firms)
         self.token = _secret_value("GITHUB_TOKEN")
         self.repo = _secret_value("GITHUB_REPO")  # e.g. "sammyatt2010-hub/prospect-engine-data"
         self.branch = _secret_value("GITHUB_BRANCH", "main")
@@ -3463,6 +3464,13 @@ class SentLog:
         if resp.status_code != 200:
             raise RuntimeError(self._describe(resp.status_code))
         payload = resp.json()
+        if payload.get("encoding") == "none" or (not payload.get("content") and payload.get("size", 0) > 0):
+            # Files over 1 MB: GitHub leaves the content out, so fetch the raw file
+            raw = requests.get(self._url(), headers={**self._headers(), "Accept": "application/vnd.github.raw+json"},
+                               params={"ref": self.branch}, timeout=20)
+            if raw.status_code != 200:
+                raise RuntimeError(self._describe(raw.status_code))
+            payload = {**payload, "content": base64.b64encode(raw.content).decode("ascii")}
         content = base64.b64decode(payload.get("content", "") or b"").decode("utf-8-sig").strip()
         if not content or content in ("[]", "null"):
             return {}, payload.get("sha")  # Emptied by hand on GitHub: treat as a fresh start
@@ -3475,12 +3483,14 @@ class SentLog:
     def _gh_write(self, data: Dict[str, Any], sha: Optional[str], message: str) -> int:
         body: Dict[str, Any] = {
             "message": message,
-            "content": base64.b64encode(json.dumps(data, indent=2, sort_keys=True).encode("utf-8")).decode("ascii"),
+            "content": base64.b64encode(json.dumps(data, indent=None if self.compact else 2, sort_keys=True,
+                                                   separators=(",", ":") if self.compact else None
+                                                   ).encode("utf-8")).decode("ascii"),
             "branch": self.branch,
         }
         if sha:
             body["sha"] = sha
-        resp = requests.put(self._url(), headers=self._headers(), json=body, timeout=12)
+        resp = requests.put(self._url(), headers=self._headers(), json=body, timeout=25)
         return resp.status_code
 
     @staticmethod
@@ -4231,7 +4241,7 @@ def record_sent(changes: Dict[str, Optional[Dict[str, Any]]]) -> None:
     local = dict(get_sent_log())
     try:
         n_on = sum(1 for v in changes.values() if v)
-        latest = SENT_LOG.apply(changes, f"Prospect Engine: {n_on} marked sent, {len(changes) - n_on} unmarked")
+        latest = SENT_LOG.apply(changes, f"Fortlox: {n_on} marked sent, {len(changes) - n_on} unmarked")
         st.session_state["sent_log_data"] = latest
     except Exception as exc:
         for key, rec in changes.items():  # Keep this session correct even if saving failed
@@ -4268,7 +4278,7 @@ def save_calls(changes: Dict[str, Optional[Dict[str, Any]]], message: str) -> No
     """Writes call-list changes to the permanent store (re-reads first so colleagues' edits survive)."""
     local = dict(get_call_list())
     try:
-        st.session_state["call_list_data"] = CALL_STORE.apply(changes, f"Prospect Engine calls: {message}")
+        st.session_state["call_list_data"] = CALL_STORE.apply(changes, f"Fortlox calls: {message}")
     except Exception as exc:
         for key, rec in changes.items():
             if rec is None:
@@ -4440,6 +4450,79 @@ def sent_record(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ------------------------------------------------------------------
+# SAVED FIRMS (every enriched firm, kept permanently in the GitHub repo)
+# ------------------------------------------------------------------
+SAVED_STORE = SentLog("GITHUB_SAVED_PATH", "saved_firms.json", ".saved_firms.json", compact=True)
+_SAVED_FIELDS = ("company_name", "company_number", "source_id", "sic_codes", "sector_guess", "registered_address",
+                 "website_url", "phones_found", "emails_found", "trading_name", "website_confidence",
+                 "site_meta_description", "discovery_notes", "other_emails")
+
+
+def get_saved() -> Dict[str, Any]:
+    if "saved_data" not in st.session_state:
+        st.session_state["saved_data"] = SAVED_STORE.load()
+    return st.session_state["saved_data"]
+
+
+def lead_key(lead: ScrapedLead) -> str:
+    return lead.source_id or lead.company_number or lead.company_name
+
+
+def _lead_to_saved(lead: ScrapedLead) -> Dict[str, Any]:
+    """Just what's needed to rebuild the firm later (keeps the GitHub file small)."""
+    d = lead.model_dump() if hasattr(lead, "model_dump") else lead.dict()
+    out = {k: d.get(k) for k in _SAVED_FIELDS}
+    out["phones_found"] = list(out.get("phones_found") or [])[:5]
+    out["emails_found"] = list(out.get("emails_found") or [])[:6]
+    out["other_emails"] = list(out.get("other_emails") or [])[:3]
+    out["discovery_notes"] = list(out.get("discovery_notes") or [])[:6]
+    out["site_meta_description"] = (out.get("site_meta_description") or "")[:300] or None
+    out["officers"] = [{k: o.get(k) for k in ("name", "role", "raw_role", "appointed_on", "is_owner")}
+                       for o in (d.get("officers") or [])[:8]]
+    return out
+
+
+def lead_from_saved(rec: Dict[str, Any]) -> ScrapedLead:
+    data = dict(rec.get("lead") or {})
+    data.setdefault("company_name", rec.get("firm") or "Unknown firm")
+    return ScrapedLead(**{k: v for k, v in data.items() if v is not None})
+
+
+def save_enriched(leads: List[ScrapedLead], vertical: str) -> None:
+    """Saves (or refreshes) enriched firms in the permanent store. One GitHub commit per batch."""
+    if not leads:
+        return
+    existing = get_saved()
+    who = get_sender().get("name", "")
+    stamp = now_uk().isoformat(timespec="seconds")
+    changes: Dict[str, Optional[Dict[str, Any]]] = {}
+    for lead in leads:
+        cn = lead_key(lead)
+        prev = existing.get(cn) or {}
+        changes[cn] = {
+            "firm": lead_display_name(lead), "vertical": vertical, "lead": _lead_to_saved(lead),
+            "saved_at": prev.get("saved_at") or stamp, "saved_by": prev.get("saved_by") or who,
+            "updated_at": stamp,
+        }
+    update_saved(changes, f"{len(changes)} firm{'s' if len(changes) != 1 else ''} saved")
+
+
+def update_saved(changes: Dict[str, Optional[Dict[str, Any]]], message: str) -> None:
+    local = dict(get_saved())
+    try:
+        st.session_state["saved_data"] = SAVED_STORE.apply(changes, f"Fortlox saved firms: {message}")
+    except Exception as exc:
+        for key, rec in changes.items():
+            if rec is None:
+                local.pop(key, None)
+            else:
+                local[key] = rec
+        st.session_state["saved_data"] = local
+        st.session_state["saved_error"] = str(exc) if isinstance(exc, RuntimeError) else "Couldn't save the firms."
+    st.session_state["saved_ver"] = st.session_state.get("saved_ver", 0) + 1
+
+
 def add_to_queue(lead: ScrapedLead, vertical: str) -> None:
     queue = st.session_state.setdefault("queue", {})
     order = st.session_state.setdefault("queue_order", [])
@@ -4513,6 +4596,7 @@ def run_enrichment(
         st.session_state["current_cn"] = first_cn
         st.session_state["current_cn_select"] = first_cn
     st.session_state["stat_dossiers"] += len(results)
+    save_enriched(list(results.values()), vertical)  # Kept permanently under Saved firms
     if results and zoho_on() and st.session_state.get("zoho_auto", True):
         summary = push_to_zoho_leads(list(results))
         if zoho_summary_text(summary):
@@ -4571,17 +4655,28 @@ with st.sidebar:
         f'<div><div class="n">{APP_NAME}</div><div class="s">{APP_TAGLINE}</div></div></div>'
     )
     # ---- Workspace switch (bookmarkable: ?view=calls) ----
-    if "view" not in st.session_state:
-        st.session_state["view"] = "calls" if st.query_params.get("view") == "calls" else "prospect"
-    _n_to_call = len(call_queue(get_call_list()))
+    _VIEWS = {"prospect": "🎯  Prospecting", "saved": "🗂️  Saved firms", "calls": "📞  Call list & callbacks"}
+    if "w_view" not in st.session_state:
+        st.session_state["w_view"] = st.query_params.get("view") if st.query_params.get("view") in _VIEWS else "prospect"
+    if st.session_state.get("goto_view") in _VIEWS:  # Set by buttons on other pages (before the switch is drawn)
+        st.session_state["w_view"] = st.session_state.pop("goto_view")
+    _calls_side = get_call_list()
+    _order_side = call_queue(_calls_side)
+    _n_to_call = len(_order_side)
+    _n_due = sum(1 for c in _order_side if _calls_side[c].get("status") == "Call back")
     st.session_state["view"] = st.radio(
-        "Workspace", ["prospect", "calls"], key="w_view", label_visibility="collapsed",
-        index=0 if st.session_state["view"] == "prospect" else 1,
-        format_func=lambda v: "🎯  Prospecting" if v == "prospect" else "📞  Call list",
+        "Workspace", list(_VIEWS), key="w_view", label_visibility="collapsed", format_func=_VIEWS.get,
     )  # Labels stay fixed: a changing label would make Streamlit reset the switch
+    _side_notes = []
+    if _n_due:
+        _side_notes.append(f'<b style="color:#FBBF24">{_n_due} callback{"s" if _n_due != 1 else ""} due now</b>')
     if _n_to_call:
-        render_html(f'<div style="font-size:.76rem;color:var(--muted);margin:-2px 0 6px 4px">'
-                    f'{_n_to_call} {"firm" if _n_to_call == 1 else "firms"} waiting on the call list</div>')
+        _side_notes.append(f'{_n_to_call} {"firm" if _n_to_call == 1 else "firms"} waiting on the call list')
+    if get_saved():
+        _side_notes.append(f'{len(get_saved())} firms saved')
+    if _side_notes:
+        render_html('<div style="font-size:.76rem;color:var(--muted);margin:-2px 0 6px 4px;line-height:1.6">'
+                    + "<br>".join(_side_notes) + "</div>")
     if st.query_params.get("view", "prospect") != st.session_state["view"]:
         st.query_params["view"] = st.session_state["view"]
     _logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logo.png")
@@ -4599,18 +4694,20 @@ with st.sidebar:
         '<div class="pe-status">Email domain checks<span class="st ok">Ready</span></div>'
         '<div class="pe-status">Pitch PDFs<span class="st ok">Ready</span></div>'
         f'<div class="pe-status">Companies House<span class="st {"ok" if ch_api_key else "idle"}">{"Connected" if ch_api_key else "Optional"}</span></div>'
-        f'<div class="pe-status">Handled ticks<span class="st {log_state}</span></div>'
+        f'<div class="pe-status">Saved firms &amp; call list<span class="st {log_state}</span></div>'
     )
     if SENT_LOG.last_error or st.session_state.get("sent_log_error"):
         st.caption("⚠️ " + (st.session_state.pop("sent_log_error", None) or SENT_LOG.last_error or ""))
     elif SENT_LOG.backend == "local":
-        st.caption("Handled ticks last until the app restarts. Use the lead list download to keep a record.")
+        st.caption("Saved firms, call list and ticks last until the app restarts. Add GITHUB_TOKEN and GITHUB_REPO"
+                   " in Secrets to keep them permanently.")
     st.caption(f"🛡️ TPS disclaimer accepted {st.session_state.get('tps_ack_at', '')}. "
                "Check every number against TPS/CTPS before contacting.")
     if st.button("↻ Refresh shared data", **FULL_WIDTH, help="Pick up ticks made by colleagues since you opened the app."):
         st.session_state.pop("sent_log_data", None)
         st.session_state.pop("call_list_data", None)
         st.session_state.pop("contacts_data", None)
+        st.session_state.pop("saved_data", None)
         for _k in ("zoho_store_data", "zoho_from", "pe_lead_fields"):
             st.session_state.pop(_k, None)
         st.session_state["call_ver"] = st.session_state.get("call_ver", 0) + 1
@@ -4648,11 +4745,12 @@ with st.sidebar:
 # ---------------- CALL LIST PAGE ----------------
 CALL_CSS = """
 <style>
-.st-key-card-call-now, .st-key-card-call-list, .st-key-card-call-empty {
+.st-key-card-call-now, .st-key-card-call-list, .st-key-card-call-empty, .st-key-card-call-upcoming, .st-key-card-saved, .st-key-card-saved-empty {
   background: linear-gradient(180deg, rgba(22, 31, 51, 0.85) 0%, rgba(17, 24, 39, 0.85) 100%);
   border: 1px solid var(--border) !important; border-radius: var(--radius); padding: 22px 22px 18px 22px;
   box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 20px 40px -24px rgba(0,0,0,0.6); }
 .st-key-card-call-now { border-color: rgba(95,208,255,.35) !important; }
+.st-key-card-call-upcoming { margin-top: 18px; }
 .cl-kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-bottom: 18px; }
 @media (max-width: 1100px) { .cl-kpis { grid-template-columns: repeat(3, 1fr); } }
 .cl-kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; border-top: 2px solid var(--c, var(--accent)); }
@@ -4686,8 +4784,8 @@ def call_hero_html(to_call: int, due: int, interested: int) -> str:
         '<div class="pe-hero"><div>'
         '<div class="pe-eyebrow"><span class="dot"></span>Shared call list · saved permanently</div>'
         '<div class="pe-title">Call list <span>&amp; dialler</span></div>'
-        '<div class="pe-sub">Firms we couldn\'t email, ready to phone. Work top to bottom: every outcome is saved'
-        ' for the whole team and shows as contacted in future searches.</div>'
+        '<div class="pe-sub">Firms ready to phone, with callbacks served up when they\'re due. Work top to bottom:'
+        ' every outcome is saved and shows as contacted in future searches.</div>'
         f'</div><div class="pe-stepper">{"<div class=pe-step-sep></div>".join(parts)}</div></div>'
     )
 
@@ -4784,7 +4882,8 @@ def render_call_page() -> None:
                 directors = ", ".join(r.get("directors") or [])
                 render_html(
                     f'<div class="cl-firm">{esc(r.get("firm", ""))}</div>'
-                    f'<div class="cl-legal">{esc(r.get("legal_name", ""))} · #{esc(pick)}</div>'
+                    f'<div class="cl-legal">{esc(r.get("legal_name", ""))}'
+                    + ("" if str(pick).startswith("OSM-") else f" · #{esc(pick)}") + "</div>"
                     f'<div class="pe-chips" style="margin-top:10px">{"".join(meta)}</div>'
                     f'<div class="cl-phone"><div class="ic">{icon("phone", 20, 2.2)}</div><div>'
                     f'<a href="tel:{esc(phone.replace(" ", ""))}">{esc(phone or "No number")}</a>'
@@ -4848,6 +4947,8 @@ def render_call_page() -> None:
                 if outcome:
                     log_call(pick, outcome, notes, datetime.combine(cb_day, cb_time) if outcome == "Call back" else None)
                     st.rerun()
+
+        render_upcoming_callbacks(calls, order)
 
     # ===== The whole list =====
     with right:
@@ -4945,6 +5046,255 @@ def render_call_page() -> None:
                                        file_name=f"Fortlox_Security_call_list_{now_uk().strftime('%Y-%m-%d')}.csv",
                                        mime="text/csv", key="call_export", **FULL_WIDTH)
 
+
+def saved_hero_html(total: int, with_email: int, fresh: int) -> str:
+    pills = [(str(total), "Saved", "active"), (str(with_email), "With email", "done"), (str(fresh), "Not contacted", "")]
+    parts = [f'<div class="pe-step {cls}"><span class="num">{n}</span>{label}</div>' for n, label, cls in pills]
+    return (
+        '<div class="pe-hero"><div>'
+        '<div class="pe-eyebrow"><span class="dot"></span>Every enriched firm · saved permanently</div>'
+        '<div class="pe-title">Saved <span>firms</span></div>'
+        '<div class="pe-sub">Every business you enrich is kept here, so you never have to search for it again.'
+        ' Reopen firms to email them, or send them to the call list.</div>'
+        f'</div><div class="pe-stepper">{"<div class=pe-step-sep></div>".join(parts)}</div></div>'
+    )
+
+
+def _saved_status(cn: str, log: Dict[str, Any], calls: Dict[str, Any]) -> str:
+    if cn in calls:
+        return "📞 " + (calls[cn].get("status") or "New")
+    if cn in log:
+        return "✓ " + (log[cn].get("status") or "Emailed")
+    return "Not contacted"
+
+
+def _saved_item(cn: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+    """A queue-style item for a saved firm (with any confirmed contact applied)."""
+    item = {"lead": lead_from_saved(rec), "vertical": rec.get("vertical") or "Estate & Lettings Agents",
+            "to": "", "to_ver": 0, "sig": None}
+    stored = get_contacts().get(cn)
+    if stored:
+        apply_contact(item, stored)
+    return item
+
+
+def render_saved_page() -> None:
+    st.markdown(CALL_CSS, unsafe_allow_html=True)
+    saved = get_saved()
+    log, calls = get_sent_log(), get_call_list()
+    ver = st.session_state.get("saved_ver", 0)
+    if st.session_state.get("saved_error"):
+        st.error(st.session_state.pop("saved_error"))
+    if st.session_state.get("saved_flash"):
+        st.success(st.session_state.pop("saved_flash"))
+
+    n_email = sum(1 for r in saved.values() if (r.get("lead") or {}).get("emails_found"))
+    n_phone = sum(1 for r in saved.values() if (r.get("lead") or {}).get("phones_found"))
+    n_fresh = sum(1 for cn in saved if cn not in log and cn not in calls)
+    render_html(
+        '<div class="cl-kpis">'
+        f'<div class="cl-kpi" style="--c:#5FD0FF"><div class="l">Saved firms</div><div class="v">{len(saved)}</div></div>'
+        f'<div class="cl-kpi" style="--c:#34D399"><div class="l">With email</div><div class="v">{n_email}</div></div>'
+        f'<div class="cl-kpi" style="--c:#29A9E1"><div class="l">With phone</div><div class="v">{n_phone}</div></div>'
+        f'<div class="cl-kpi" style="--c:#FBBF24"><div class="l">Not contacted</div><div class="v">{n_fresh}</div></div>'
+        f'<div class="cl-kpi" style="--c:#5E6A82"><div class="l">On call list</div><div class="v">{sum(1 for c in saved if c in calls)}</div></div>'
+        "</div>"
+    )
+    if not saved:
+        with st.container(key="card-saved-empty"):
+            render_html(
+                f'<div class="pe-empty"><div style="color:var(--accent-2);display:inline-block;padding:18px;border-radius:20px;'
+                f'background:rgba(95,208,255,.1);border:1px solid rgba(95,208,255,.3)">{icon("target", 40, 1.6)}</div>'
+                '<div class="t">No saved firms yet</div>'
+                '<div class="s">Every firm you enrich in Prospecting is saved here automatically.</div>'
+                "<ol><li>Open <b>&nbsp;Prospecting</b></li><li>Find businesses in an area</li>"
+                "<li>Enrich them, and they appear here</li></ol></div>"
+            )
+        return
+
+    with st.container(key="card-saved"):
+        section_header("≡", "Your saved firms", "Search, filter, then tick firms to reopen, call or export them.")
+        f1, f2, f3 = st.columns([1.2, 1.3, 1])
+        with f1:
+            q = st.text_input("Search", key="sv_q", placeholder="Firm, contact, town, email or phone").strip().lower()
+        with f2:
+            sectors = sorted({r.get("vertical", "") for r in saved.values() if r.get("vertical")})
+            pick_sec = st.multiselect("Sector", sectors, default=[], key="sv_sector", placeholder="All sectors")
+        with f3:
+            show = st.selectbox("Show", ["All", "Not contacted", "Has email", "Phone only", "On call list", "Emailed / handled"],
+                                key="sv_show")
+        rows = []
+        for cn, r in sorted(saved.items(), key=lambda kv: kv[1].get("updated_at", ""), reverse=True):
+            L = r.get("lead") or {}
+            emails, phones = L.get("emails_found") or [], L.get("phones_found") or []
+            if pick_sec and r.get("vertical") not in pick_sec:
+                continue
+            if show == "Not contacted" and (cn in log or cn in calls):
+                continue
+            if show == "Has email" and not emails:
+                continue
+            if show == "Phone only" and (emails or not phones):
+                continue
+            if show == "On call list" and cn not in calls:
+                continue
+            if show == "Emailed / handled" and cn not in log:
+                continue
+            contact = (get_contacts().get(cn) or {}).get("name") or ""
+            if not contact:
+                owners = [o for o in (L.get("officers") or []) if o.get("is_owner")] or (L.get("officers") or [])
+                contact = display_officer_name(owners[0]["name"]) if owners else ""
+            area = L.get("registered_address") or ""
+            hay = " ".join([r.get("firm", ""), L.get("company_name", ""), contact, area, " ".join(emails), " ".join(phones)]).lower()
+            if q and q not in hay:
+                continue
+            try:
+                saved_on = datetime.fromisoformat(r.get("saved_at", "")).strftime("%d %b %Y").lstrip("0")
+            except ValueError:
+                saved_on = ""
+            rows.append({
+                "cn": cn, "Select": False, "Firm": r.get("firm") or L.get("company_name", ""),
+                "Sector": r.get("vertical", ""), "Status": _saved_status(cn, log, calls), "Contact": contact,
+                "Email": (emails or [""])[0], "Phone": (phones or [""])[0], "Website": L.get("website_url") or "",
+                "Address": area, "Saved": saved_on,
+            })
+        st.caption(f"Showing {len(rows)} of {len(saved)} saved firms.")
+        if not rows:
+            st.info("No saved firms match these filters.")
+            return
+        df = pd.DataFrame(rows)
+        kwargs = dict(
+            hide_index=True, num_rows="fixed", key=f"saved_table_{ver}_{len(rows)}",
+            height=min(38 + 35 * len(df), 520),
+            column_order=["Select", "Firm", "Sector", "Status", "Contact", "Email", "Phone", "Website", "Address", "Saved"],
+            disabled=["Firm", "Sector", "Status", "Contact", "Email", "Phone", "Website", "Address", "Saved"],
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select", width="small"),
+                "Firm": st.column_config.TextColumn("Firm", width="medium"),
+                "Sector": st.column_config.TextColumn("Sector", width="small"),
+                "Status": st.column_config.TextColumn("Status", width="small"),
+                "Contact": st.column_config.TextColumn("Contact", width="small"),
+                "Email": st.column_config.TextColumn("Email", width="medium"),
+                "Phone": st.column_config.TextColumn("Phone", width="small"),
+                "Website": st.column_config.LinkColumn("Website", width="small", display_text="Open ↗"),
+                "Address": st.column_config.TextColumn("Address", width="medium"),
+                "Saved": st.column_config.TextColumn("Saved", width="small"),
+            },
+        )
+        try:
+            edited = st.data_editor(df, width="stretch", **kwargs)
+        except Exception:
+            edited = st.data_editor(df, use_container_width=True, **kwargs)
+        picked = [row["cn"] for _, row in edited.iterrows() if row["Select"]]
+        can_call = [c for c in picked if c not in calls and (saved[c].get("lead") or {}).get("phones_found")]
+
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            if st.button(f"✉️  Reopen {len(picked)} to email" if picked else "✉️  Reopen to email", type="primary",
+                         disabled=not picked, key="sv_open", **FULL_WIDTH,
+                         help="Loads the ticked firms into Review & send under Prospecting, with fresh email drafts."):
+                for c in picked:
+                    add_to_queue(lead_from_saved(saved[c]), saved[c].get("vertical") or "Estate & Lettings Agents")
+                st.session_state["current_cn"] = picked[0]
+                st.session_state["current_cn_select"] = picked[0]
+                st.session_state["goto_view"] = "prospect"
+                st.session_state["saved_ver"] = ver + 1
+                st.rerun()
+        with a2:
+            if st.button(f"📞  Add {len(can_call)} to call list" if can_call else "📞  Add to call list",
+                         disabled=not can_call, key="sv_call", **FULL_WIDTH,
+                         help="Firms with a phone number that aren't already on the call list."):
+                save_calls({c: call_record_from_item(_saved_item(c, saved[c])) for c in can_call}, f"{len(can_call)} added")
+                st.session_state["saved_ver"] = ver + 1  # Clear the ticks
+                st.session_state["saved_flash"] = (f"{len(can_call)} firms added to the call list."
+                                                   " Open Call list & callbacks in the sidebar to start calling.")
+                st.rerun()
+        with a3:
+            export = df.drop(columns=["cn", "Select"])
+            if picked:
+                export = export[df["cn"].isin(picked)]
+            st.download_button(f"⬇  Export {len(export)} (.csv)", data=export.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"Fortlox_Security_saved_firms_{now_uk().strftime('%Y-%m-%d')}.csv",
+                               mime="text/csv", key="sv_export", **FULL_WIDTH,
+                               help="Ticked firms, or everything shown if none are ticked.")
+        with a4:
+            with st.popover(f"🗑️  Remove {len(picked)}" if picked else "🗑️  Remove", disabled=not picked, **FULL_WIDTH):
+                st.caption("Removes the ticked firms from Saved firms. Call list entries and ticks stay.")
+                if st.button(f"Yes, remove {len(picked)}", key=f"sv_del_{ver}", type="primary"):
+                    update_saved({c: None for c in picked}, f"{len(picked)} removed")
+                    st.session_state["saved_flash"] = f"{len(picked)} firms removed."
+                    st.rerun()
+        if len(picked) > 1 and len(can_call) < len(picked):
+            st.caption(f"💡 {len(picked) - len(can_call)} ticked firms are already on the call list or have no phone number.")
+
+
+def render_upcoming_callbacks(calls: Dict[str, Any], due_order: List[str]) -> None:
+    """Callbacks booked for later, soonest first."""
+    upcoming = []
+    for cn, r in calls.items():
+        if r.get("status") == "Call back" and cn not in due_order and r.get("callback"):
+            upcoming.append((r.get("callback"), cn))
+    upcoming.sort()
+    with st.container(key="card-call-upcoming"):
+        section_header("📅", "Booked callbacks", f"{len(upcoming)} coming up · each one joins the queue when it's due")
+        if not upcoming:
+            render_html('<div class="pe-hint">No callbacks booked. Use <b>Call back</b> on a call to book one.</div>')
+            return
+        today = now_uk().date()
+        html_rows = []
+        for when, cn in upcoming[:15]:
+            r = calls[cn]
+            try:
+                d = datetime.fromisoformat(when)
+                day = "Today" if d.date() == today else "Tomorrow" if d.date() == today + timedelta(days=1) else d.strftime("%a %d %b")
+                label = f"{day} {d.strftime('%H:%M')}"
+            except ValueError:
+                label = when
+            phone = r.get("phone", "")
+            html_rows.append(
+                f'<div class="row"><span class="when" style="min-width:110px">{esc(label)}</span>'
+                f'<span><b>{esc(r.get("firm", ""))}</b>'
+                + (f' · <a href="tel:{esc(phone.replace(" ", ""))}">{esc(phone)}</a>' if phone else "")
+                + (f' · {esc(r.get("notes", "")[:80])}' if r.get("notes") else "")
+                + "</span></div>"
+            )
+        render_html('<div class="cl-hist">' + "".join(html_rows) + "</div>")
+        if len(upcoming) > 15:
+            st.caption(f"+ {len(upcoming) - 15} more. Filter the list by 'Call back' to see them all.")
+        ics = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Fortlox Prospector//EN"]
+        for when, cn in upcoming:
+            try:
+                d = datetime.fromisoformat(when)
+            except ValueError:
+                continue
+            r = calls[cn]
+            ics += ["BEGIN:VEVENT", f"UID:{re.sub(r'[^A-Za-z0-9]', '', cn)}-{d.strftime('%Y%m%dT%H%M')}@fortlox",
+                    f"DTSTART;TZID=Europe/London:{d.strftime('%Y%m%dT%H%M%S')}",
+                    f"DTEND;TZID=Europe/London:{(d + timedelta(minutes=15)).strftime('%Y%m%dT%H%M%S')}",
+                    f"SUMMARY:Call back {r.get('firm', '')} ({r.get('phone', '')})".replace(",", "\\,"),
+                    "DESCRIPTION:" + (f"Ask for {r.get('contact', '')}. {r.get('notes', '')}").replace("\n", " ").replace(",", "\\,"),
+                    "END:VEVENT"]
+        ics.append("END:VCALENDAR")
+        st.download_button("🗓️  Add callbacks to my calendar (.ics)", data="\r\n".join(ics).encode("utf-8"),
+                           file_name="Fortlox_callbacks.ics", mime="text/calendar", key="cb_ics", **FULL_WIDTH,
+                           help="Opens in Outlook, Google Calendar or Apple Calendar.")
+
+
+if st.session_state.get("view") == "saved":
+    render_saved_page()
+    _sv = get_saved()
+    _lg = get_sent_log()
+    _cl = get_call_list()
+    render_html(saved_hero_html(len(_sv), sum(1 for r in _sv.values() if (r.get("lead") or {}).get("emails_found")),
+                                sum(1 for c in _sv if c not in _lg and c not in _cl)), target=hero_slot)
+    render_html(
+        '<div class="pe-stats">'
+        f'<div class="pe-stat"><div class="v">{len(_sv)}</div><div class="l">Saved</div></div>'
+        f'<div class="pe-stat"><div class="v">{len(call_queue(_cl))}</div><div class="l">To call</div></div>'
+        f'<div class="pe-stat"><div class="v">{len(_lg)}</div><div class="l">Handled</div></div>'
+        "</div>",
+        target=sidebar_stats_slot,
+    )
+    st.stop()
 
 if st.session_state.get("view") == "calls":
     render_call_page()
