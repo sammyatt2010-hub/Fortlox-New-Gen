@@ -500,7 +500,7 @@ def check_disclaimer() -> bool:
                 "By using this application you understand that it is <b>your sole responsibility</b> "
                 "to check every number against the TPS and CTPS registers (and to follow any other "
                 "marketing rules that apply) <b>before contacting any business or person</b> found "
-                "through it. Fortlox Security accepts no liability for contact made without these checks.</div>"
+                "through it. The app developer accepts no liability for contact made without these checks.</div>"
             )
             render_html(
                 "<style>.st-key-card-login [data-testid='stCheckbox']{margin:14px 0 6px}"
