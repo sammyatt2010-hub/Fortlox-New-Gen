@@ -319,6 +319,7 @@ _ICON_PATHS = {
     "pin": '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>',
     "target": '<circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>',
     "check": '<polyline points="20 6 9 17 4 12"/>',
+    "shield": '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
     "lock": '<rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
     "pointer": '<path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/>',
 }
@@ -474,7 +475,50 @@ def check_password() -> bool:
     return False
 
 
+TPS_DISCLAIMER = (
+    "Contact details shown in this app come from public sources and have <b>not</b> been checked "
+    "against the Telephone Preference Service (TPS) or Corporate TPS (CTPS) registers."
+)
+
+
+def check_disclaimer() -> bool:
+    """Shown once per sign-in: the user must accept the TPS disclaimer before using the app."""
+    if st.session_state.get("tps_ack"):
+        return True
+    st.set_page_config(page_title=f"{APP_NAME} · Before you start", page_icon="🎯", layout="centered")
+    inject_css()
+    _, mid, _ = st.columns([1, 3, 1])
+    with mid:
+        render_html(
+            f'<div class="pe-login-head"><div class="pe-logo">{icon("shield", 26, 2.2)}</div>'
+            '<div class="t">Before you start</div>'
+            '<div class="s">Please read and accept the disclaimer below</div></div>'
+        )
+        with st.container(key="card-login"):
+            render_html(
+                f'<div style="font-size:14px;line-height:1.6">{TPS_DISCLAIMER}<br><br>'
+                "By using this application you understand that it is <b>your sole responsibility</b> "
+                "to check every number against the TPS and CTPS registers (and to follow any other "
+                "marketing rules that apply) <b>before contacting any business or person</b> found "
+                "through it. Fortlox Security accepts no liability for contact made without these checks.</div>"
+            )
+            render_html(
+                "<style>.st-key-card-login [data-testid='stCheckbox']{margin:14px 0 6px}"
+                ".st-key-card-login [data-testid='stCheckbox'] p{text-transform:none!important;letter-spacing:0!important;"
+                "font-size:14px!important;font-weight:600!important;color:var(--text,#E6EDF7)!important}"
+                ".st-key-card-login button:disabled{opacity:.4;filter:grayscale(.6);box-shadow:none!important;cursor:not-allowed}</style>"
+            )
+            agreed = st.checkbox("I understand and accept responsibility for TPS/CTPS checks", key="tps_tick")
+            if st.button("Accept and continue", type="primary", disabled=not agreed, **FULL_WIDTH):
+                st.session_state["tps_ack"] = True
+                st.session_state["tps_ack_at"] = datetime.now().strftime("%d %b %Y, %H:%M")
+                st.rerun()
+    return False
+
+
 if not check_password():
+    st.stop()
+if not check_disclaimer():
     st.stop()
 
 # ==========================================
@@ -3548,6 +3592,7 @@ def build_lead_list_csv(items: List[Dict[str, Any]], log: Dict[str, Any]) -> byt
             "Other emails": "; ".join(e for e in lead.emails_found if e != item.get("to")),
             "Phone": (lead.phones_found or [""])[0],
             "Other phones": "; ".join(lead.phones_found[1:]),
+            "TPS/CTPS checked (you)": "",
             "Directors": "; ".join(directors),
             "Website": lead.website_url or "",
             "Website match": (lead.website_confidence or "") if lead.website_url else "Not found",
@@ -3588,6 +3633,10 @@ def build_drafts_zip(items: List[Dict[str, Any]], attach_overview: bool) -> Tupl
                    item["subject"], lead.website_url or "", lead.website_confidence or "Not found"]
             summary.write(",".join('"' + str(v).replace('"', '""') + '"' for v in row) + "\n")
         zf.writestr("_summary.csv", summary.getvalue())
+        zf.writestr("_READ_ME_FIRST_TPS.txt",
+                    "These contact details come from public sources and have NOT been checked against the\r\n"
+                    "TPS or Corporate TPS (CTPS) registers. It is your sole responsibility to carry out these\r\n"
+                    "checks before contacting any business or person in these drafts.\r\n")
     return buf.getvalue(), written, skipped
 
 
@@ -4556,6 +4605,8 @@ with st.sidebar:
         st.caption("⚠️ " + (st.session_state.pop("sent_log_error", None) or SENT_LOG.last_error or ""))
     elif SENT_LOG.backend == "local":
         st.caption("Handled ticks last until the app restarts. Use the lead list download to keep a record.")
+    st.caption(f"🛡️ TPS disclaimer accepted {st.session_state.get('tps_ack_at', '')}. "
+               "Check every number against TPS/CTPS before contacting.")
     if st.button("↻ Refresh shared data", **FULL_WIDTH, help="Pick up ticks made by colleagues since you opened the app."):
         st.session_state.pop("sent_log_data", None)
         st.session_state.pop("call_list_data", None)
@@ -5612,6 +5663,7 @@ if queue:
             )
             _apply_editor(edited, log_now)
             ready_sel = [c for c in ready_all if queue[c]["include"]]
+            st.caption("🛡️ Not checked against TPS/CTPS. Screen these contacts yourself before sending or calling.")
             r1, r2 = st.columns([1.4, 1])
             with r1:
                 if ready_sel:
